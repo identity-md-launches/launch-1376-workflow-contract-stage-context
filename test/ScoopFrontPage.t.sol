@@ -29,7 +29,7 @@ contract ScoopFrontPageTest is Test {
     );
     event Vetoed(uint256 indexed day, address indexed buyer, uint256 refunded);
     event Burned(uint256 indexed day, address indexed caller, uint256 amount);
-    event PriceChanged(uint256 oldPrice, uint256 newPrice);
+    event PriceChanged(uint256 oldPrice, uint256 newPrice, uint256 effectiveFromDay);
 
     function setUp() public {
         vm.warp(START);
@@ -80,8 +80,11 @@ contract ScoopFrontPageTest is Test {
 
     function test_constructor_emitsInitialPrice() public {
         vm.expectEmit(true, true, true, true);
-        emit PriceChanged(0, PRICE);
-        new ScoopFrontPage(address(scoop), owner);
+        emit PriceChanged(0, PRICE, START_DAY);
+        ScoopFrontPage p = new ScoopFrontPage(address(scoop), owner);
+        (uint256 next, uint256 fromDay) = p.nextPrice();
+        assertEq(next, PRICE);
+        assertEq(fromDay, 0, "initial price is in force from the first block");
     }
 
     function test_constructor_doesNotRequireTokenCode() public {
@@ -367,12 +370,50 @@ contract ScoopFrontPageTest is Test {
     // Price
     // ─────────────────────────────────────────────────────────────────────────────
 
-    function test_setPrice_ownerChangesPriceAndEmits() public {
+    function test_setPrice_schedulesForNextDayAndEmits() public {
         vm.expectEmit(true, true, true, true);
-        emit PriceChanged(PRICE, 5e18);
+        emit PriceChanged(PRICE, 5e18, START_DAY + 1);
         vm.prank(owner);
         page.setPrice(5e18);
+
+        // Today's price is unchanged; the new one is visible as scheduled.
+        assertEq(page.price(), PRICE);
+        (uint256 next, uint256 fromDay) = page.nextPrice();
+        assertEq(next, 5e18);
+        assertEq(fromDay, START_DAY + 1);
+
+        // Last second of today: still the old price.
+        vm.warp((START_DAY + 1) * DAY - 1);
+        assertEq(page.price(), PRICE);
+
+        // From midnight UTC: the new price.
+        vm.warp((START_DAY + 1) * DAY);
         assertEq(page.price(), 5e18);
+        vm.warp((START_DAY + 40) * DAY);
+        assertEq(page.price(), 5e18);
+    }
+
+    /// @dev The reviewer's race: the owner's setPrice lands before a sponsor's already-signed book.
+    ///      The sponsor must never pay more than the price() they read.
+    function test_setPrice_cannotRepriceABookingInFlight() public {
+        uint256 day = _tomorrow();
+        uint256 quoted = page.price();
+        uint256 before = scoop.balanceOf(alice);
+
+        vm.prank(owner);
+        page.setPrice(10 * PRICE);
+
+        _book(alice, day);
+        assertEq(before - scoop.balanceOf(alice), quoted, "sponsor paid the quoted price");
+        assertEq(page.slotOf(day).paid, quoted);
+
+        // Lowering the price does not give an in-flight booking a discount either: the day's price
+        // is what it is until midnight.
+        vm.prank(owner);
+        page.setPrice(PRICE / 4);
+        uint256 bobBefore = scoop.balanceOf(bob);
+        _book(bob, day + 1);
+        assertEq(bobBefore - scoop.balanceOf(bob), quoted);
     }
 
     function test_setPrice_appliesOnlyToDaysNotYetBooked() public {
@@ -385,7 +426,9 @@ contract ScoopFrontPageTest is Test {
         // Existing booking keeps its paid amount.
         assertEq(page.slotOf(day).paid, PRICE);
 
-        // New booking pays the new price.
+        // Next UTC day: a new booking pays the new price.
+        vm.warp(block.timestamp + DAY);
+        assertEq(page.price(), 3 * PRICE);
         uint256 bobBefore = scoop.balanceOf(bob);
         _book(bob, day + 1);
         assertEq(page.slotOf(day + 1).paid, 3 * PRICE);
@@ -393,13 +436,59 @@ contract ScoopFrontPageTest is Test {
 
         // Veto of the old booking refunds what was paid, not the new price.
         vm.prank(owner);
-        page.veto(day);
-        assertEq(scoop.balanceOf(alice), 10 * PRICE);
+        page.veto(day + 1);
+        assertEq(scoop.balanceOf(bob), bobBefore);
+        assertEq(page.slotOf(day).paid, PRICE);
+    }
+
+    function test_setPrice_secondCallSameDayReplacesScheduledPrice() public {
+        vm.startPrank(owner);
+        page.setPrice(5e18);
+        vm.expectEmit(true, true, true, true);
+        emit PriceChanged(PRICE, 7e18, START_DAY + 1);
+        page.setPrice(7e18);
+        vm.stopPrank();
+
+        assertEq(page.price(), PRICE, "today's price untouched");
+        (uint256 next, uint256 fromDay) = page.nextPrice();
+        assertEq(next, 7e18);
+        assertEq(fromDay, START_DAY + 1);
+
+        vm.warp((START_DAY + 1) * DAY);
+        assertEq(page.price(), 7e18, "the 5e18 schedule was replaced, never in force");
+    }
+
+    function test_setPrice_chainedChangesOverDays() public {
+        vm.prank(owner);
+        page.setPrice(5e18); // in force from START_DAY + 1
+
+        vm.warp((START_DAY + 1) * DAY + 1 hours);
+        assertEq(page.price(), 5e18);
+        vm.expectEmit(true, true, true, true);
+        emit PriceChanged(5e18, 9e18, START_DAY + 2);
+        vm.prank(owner);
+        page.setPrice(9e18); // in force from START_DAY + 2; 5e18 stays today
+
+        assertEq(page.price(), 5e18);
+        uint256 before = scoop.balanceOf(alice);
+        _book(alice, START_DAY + 2);
+        assertEq(before - scoop.balanceOf(alice), 5e18);
+
+        vm.warp((START_DAY + 2) * DAY);
+        assertEq(page.price(), 9e18);
+        before = scoop.balanceOf(alice);
+        _book(alice, START_DAY + 3);
+        assertEq(before - scoop.balanceOf(alice), 9e18);
+
+        // Many days later with no further change the scheduled price is still the live one.
+        vm.warp((START_DAY + 300) * DAY);
+        assertEq(page.price(), 9e18);
     }
 
     function test_setPrice_zeroMakesSlotsFree() public {
         vm.prank(owner);
         page.setPrice(0);
+        vm.warp(block.timestamp + DAY);
         uint256 day = _tomorrow();
         uint256 before = scoop.balanceOf(alice);
         _book(alice, day);
@@ -416,6 +505,8 @@ contract ScoopFrontPageTest is Test {
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
         page.setPrice(1);
         assertEq(page.price(), PRICE);
+        (uint256 next,) = page.nextPrice();
+        assertEq(next, PRICE);
     }
 
     // ─────────────────────────────────────────────────────────────────────────────
@@ -618,6 +709,14 @@ contract ScoopFrontPageTest is Test {
         assertEq(r.length, 0);
     }
 
+    function test_bookedDays_topOfDomainDoesNotOverflow() public view {
+        uint256 max = type(uint256).max;
+        assertEq(page.bookedDays(max, max).length, 0);
+        assertEq(page.bookedDays(max - 10, max).length, 0);
+        assertEq(page.bookedDays(max - 365, max).length, 0);
+        assertEq(page.bookedDays(0, 0).length, 0);
+    }
+
     function test_revert_bookedDays_tooWide() public {
         vm.expectRevert(abi.encodeWithSelector(ScoopFrontPage.InvalidRange.selector, 100, 100 + 366));
         page.bookedDays(100, 100 + 366);
@@ -677,6 +776,24 @@ contract ScoopFrontPageTest is Test {
         page.acceptOwnership();
     }
 
+    function test_revert_renounceOwnership_disabled() public {
+        uint256 day = _tomorrow();
+        _book(alice, day);
+
+        vm.prank(owner);
+        vm.expectRevert(ScoopFrontPage.RenounceDisabled.selector);
+        page.renounceOwnership();
+        vm.prank(alice);
+        vm.expectRevert(ScoopFrontPage.RenounceDisabled.selector);
+        page.renounceOwnership();
+
+        // Ownership and its powers are intact.
+        assertEq(page.owner(), owner);
+        vm.prank(owner);
+        page.veto(day);
+        assertEq(page.slotOf(day).buyer, address(0));
+    }
+
     // ─────────────────────────────────────────────────────────────────────────────
     // Custody: no withdraw path, conservation of held SCOOP
     // ─────────────────────────────────────────────────────────────────────────────
@@ -719,12 +836,13 @@ contract ScoopFrontPageTest is Test {
 
         vm.prank(owner);
         page.setPrice(PRICE / 2);
+        vm.warp(block.timestamp + DAY); // the half price applies from the next UTC day
         _book(bob, day + 3); // half price, will be burned
 
         assertEq(scoop.balanceOf(address(page)), 3 * PRICE + PRICE / 2);
 
         vm.prank(owner);
-        page.veto(day + 1);
+        page.veto(day + 1); // day + 1 has not started yet
         assertEq(scoop.balanceOf(address(page)), 2 * PRICE + PRICE / 2);
 
         vm.warp((day + 4) * DAY);
@@ -792,8 +910,10 @@ contract ScoopFrontPageTest is Test {
             }
 
             if ((r >> 24) % 3 == 0) {
+                uint256 quoted = page.price();
                 vm.prank(owner);
                 page.setPrice(((r >> 32) % 5) * 1e18);
+                assertEq(page.price(), quoted, "price moved within the day");
             }
             if ((r >> 40) % 2 == 0) {
                 vm.warp(block.timestamp + 1 days + ((r >> 48) % DAY));
@@ -801,6 +921,25 @@ contract ScoopFrontPageTest is Test {
 
             assertEq(scoop.balanceOf(address(page)), held, "held balance drifted");
         }
+    }
+
+    /// @dev Whatever the owner does, price() read at any moment is what book pulls for the rest of
+    ///      that UTC day.
+    function testFuzz_priceStableWithinDay(uint256 newPrice, uint256 secondsIntoDay, uint256 secondsLater) public {
+        newPrice = bound(newPrice, 0, 10 * PRICE);
+        secondsIntoDay = bound(secondsIntoDay, 0, DAY - 2);
+        secondsLater = bound(secondsLater, 0, DAY - 2 - secondsIntoDay);
+
+        vm.warp(START_DAY * DAY + secondsIntoDay);
+        uint256 quoted = page.price();
+        vm.prank(owner);
+        page.setPrice(newPrice);
+
+        vm.warp(block.timestamp + secondsLater);
+        assertEq(page.price(), quoted);
+        uint256 before = scoop.balanceOf(alice);
+        _book(alice, START_DAY + 1);
+        assertEq(before - scoop.balanceOf(alice), quoted);
     }
 
     // ─────────────────────────────────────────────────────────────────────────────

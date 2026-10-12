@@ -19,8 +19,13 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 ///                     once per day. The booking stays recorded for the archive.
 ///
 ///      Owner powers are exactly: change the price (future bookings only), veto a booking before its
-///      day, and the Ownable2Step ownership handover. There is no pause, no upgrade, and no way to
-///      withdraw held SCOOP. Held SCOOP only ever goes back to its buyer (veto) or to dEaD (burn).
+///      day, and the Ownable2Step ownership handover. `renounceOwnership` is disabled. There is no
+///      pause, no upgrade, and no way to withdraw held SCOOP. Held SCOOP only ever goes back to its
+///      buyer (veto) or to dEaD (burn).
+///
+///      Price changes take effect from the next UTC day. The price a sponsor reads with `price()` is
+///      therefore the price `book` pulls for the rest of the current UTC day, whatever the owner does
+///      in between: `setPrice` cannot reprice a booking that is already in flight.
 contract ScoopFrontPage is Ownable2Step {
     using SafeERC20 for IERC20;
 
@@ -78,8 +83,15 @@ contract ScoopFrontPage is Ownable2Step {
     /// @notice The SCOOP token slots are paid in.
     IERC20 public immutable scoop;
 
-    /// @dev Current slot price in SCOOP minor units.
+    /// @dev Slot price in SCOOP minor units in force before `_nextPriceDay`.
     uint256 private _price;
+
+    /// @dev Slot price in SCOOP minor units in force from `_nextPriceDay` on.
+    uint256 private _nextPrice;
+
+    /// @dev First UTC day on which `_nextPrice` applies. Once `currentDay() >= _nextPriceDay` the
+    ///      change has taken effect and `_nextPrice` is the live price.
+    uint256 private _nextPriceDay;
 
     /// @dev day => slot.
     mapping(uint256 day => Slot) private _slots;
@@ -99,8 +111,10 @@ contract ScoopFrontPage is Ownable2Step {
     /// @notice A past day's held SCOOP was sent to the dEaD address.
     event Burned(uint256 indexed day, address indexed caller, uint256 amount);
 
-    /// @notice The slot price changed. Applies to days not yet booked.
-    event PriceChanged(uint256 oldPrice, uint256 newPrice);
+    /// @notice The owner scheduled a new slot price. `newPrice` is what `book` pulls from UTC day
+    ///         `effectiveFromDay` on; `oldPrice` stays in force until then. Existing bookings keep
+    ///         what they paid.
+    event PriceChanged(uint256 oldPrice, uint256 newPrice, uint256 effectiveFromDay);
 
     // ─────────────────────────────────────────────────────────────────────────────
     // Errors
@@ -129,6 +143,8 @@ contract ScoopFrontPage is Ownable2Step {
     error AlreadyBurned(uint256 day);
     /// @dev `bookedDays` range is reversed or wider than `MAX_QUERY_RANGE`.
     error InvalidRange(uint256 from, uint256 to);
+    /// @dev `renounceOwnership` is not an owner power of this contract.
+    error RenounceDisabled();
 
     // ─────────────────────────────────────────────────────────────────────────────
     // Constructor
@@ -142,7 +158,9 @@ contract ScoopFrontPage is Ownable2Step {
         if (scoop_ == address(0)) revert ZeroToken();
         scoop = IERC20(scoop_);
         _price = INITIAL_PRICE;
-        emit PriceChanged(0, INITIAL_PRICE);
+        _nextPrice = INITIAL_PRICE;
+        // `_nextPriceDay` stays 0, so the initial price is in force from the first block.
+        emit PriceChanged(0, INITIAL_PRICE, currentDay());
     }
 
     // ─────────────────────────────────────────────────────────────────────────────
@@ -155,7 +173,9 @@ contract ScoopFrontPage is Ownable2Step {
     /// @param headline 1-80 printable ASCII characters.
     /// @param link Empty, or an `https://` URL of at most 120 printable ASCII characters.
     /// @dev Pulls `price()` SCOOP from the caller, who must have approved this contract. The amount
-    ///      paid is stored with the slot, so a later price change never affects a refund.
+    ///      paid is stored with the slot, so a later price change never affects a refund. Because a
+    ///      price change only takes effect from the next UTC day, the price read earlier in the same
+    ///      UTC day is the price pulled here; the owner cannot reprice a booking already in flight.
     function book(uint256 day, address token, string calldata headline, string calldata link) external {
         (uint256 first, uint256 last) = bookingWindow();
         if (day < first || day > last) revert DayOutOfWindow(day, first, last);
@@ -164,7 +184,7 @@ contract ScoopFrontPage is Ownable2Step {
         _validateHeadline(headline);
         _validateLink(link);
 
-        uint256 paid = _price;
+        uint256 paid = price();
         _slots[day] = Slot({buyer: msg.sender, token: token, paid: paid, burned: false, headline: headline, link: link});
 
         emit Booked(day, msg.sender, token, paid, headline, link);
@@ -205,20 +225,42 @@ contract ScoopFrontPage is Ownable2Step {
     // Owner
     // ─────────────────────────────────────────────────────────────────────────────
 
-    /// @notice Owner only. Set the price for days not yet booked. Existing bookings keep what they paid.
+    /// @notice Owner only. Schedule the price for bookings made from the next UTC day on. Bookings
+    ///         made for the rest of today pay today's price, and existing bookings keep what they paid.
+    ///         Calling it again before midnight replaces the scheduled price.
     function setPrice(uint256 newPrice) external onlyOwner {
-        uint256 old = _price;
-        _price = newPrice;
-        emit PriceChanged(old, newPrice);
+        uint256 today = currentDay();
+        uint256 old = price();
+        if (today >= _nextPriceDay) {
+            // The previously scheduled change has taken effect: make it the base price.
+            _price = _nextPrice;
+        }
+        _nextPrice = newPrice;
+        _nextPriceDay = today + 1;
+        emit PriceChanged(old, newPrice, today + 1);
+    }
+
+    /// @notice Disabled. The owner's powers are the price change, the veto and the two-step
+    ///         handover; giving up ownership would leave bookings with no moderation forever.
+    function renounceOwnership() public pure override {
+        revert RenounceDisabled();
     }
 
     // ─────────────────────────────────────────────────────────────────────────────
     // Views
     // ─────────────────────────────────────────────────────────────────────────────
 
-    /// @notice Current price of a slot in SCOOP minor units.
-    function price() external view returns (uint256) {
-        return _price;
+    /// @notice Price of a slot in SCOOP minor units for a booking made right now. Stable for the
+    ///         rest of the current UTC day.
+    function price() public view returns (uint256) {
+        return currentDay() >= _nextPriceDay ? _nextPrice : _price;
+    }
+
+    /// @notice The scheduled price and the first UTC day it applies from. When `effectiveFromDay`
+    ///         is at or before `currentDay()` the change has already taken effect and `newPrice`
+    ///         equals `price()`; otherwise `newPrice` is what bookings will pay from that day on.
+    function nextPrice() external view returns (uint256 newPrice, uint256 effectiveFromDay) {
+        return (_nextPrice, _nextPriceDay);
     }
 
     /// @notice The slot booked for `day`. `buyer == address(0)` means the day is free.
@@ -241,14 +283,19 @@ contract ScoopFrontPage is Ownable2Step {
     function bookedDays(uint256 from, uint256 to) external view returns (uint256[] memory days_) {
         if (to < from || to - from >= MAX_QUERY_RANGE) revert InvalidRange(from, to);
 
+        // Iterate a bounded counter rather than `d <= to`, which would overflow when `to` is
+        // `type(uint256).max`. `span` is at most MAX_QUERY_RANGE and `from + k <= to`, so no overflow.
+        uint256 span = to - from + 1;
+
         uint256 count = 0;
-        for (uint256 d = from; d <= to; ++d) {
-            if (_slots[d].buyer != address(0)) ++count;
+        for (uint256 k = 0; k < span; ++k) {
+            if (_slots[from + k].buyer != address(0)) ++count;
         }
 
         days_ = new uint256[](count);
         uint256 i = 0;
-        for (uint256 d = from; d <= to; ++d) {
+        for (uint256 k = 0; k < span; ++k) {
+            uint256 d = from + k;
             if (_slots[d].buyer != address(0)) days_[i++] = d;
         }
     }
