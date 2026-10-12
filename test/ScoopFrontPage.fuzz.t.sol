@@ -11,8 +11,9 @@ import {ScoopFrontPage} from "../src/ScoopFrontPage.sol";
 
 /// @dev Stateless property tests and pinned edge cases for ScoopFrontPage: the window at every offset
 ///      and second, every byte the validators must reject, exact-amount token pulls, refund-equals-paid
-///      under price changes, timing boundaries of veto and burn, and what happens when the token
-///      misbehaves. The invariant suite covers random sequences; this one covers the input space.
+///      under price changes, the next-midnight price schedule at every second, timing boundaries of
+///      veto and burn, and what happens when the token misbehaves. The invariant suite covers random
+///      sequences; this one covers the input space.
 /// forge-config: default.fuzz.runs = 1000
 contract ScoopFrontPageFuzzTest is Test {
     uint256 internal constant DAY = 1 days;
@@ -261,11 +262,13 @@ contract ScoopFrontPageFuzzTest is Test {
     // Price and token pulls: exact amounts, exact allowances
     // ─────────────────────────────────────────────────────────────────────────────
 
-    /// @dev For any price the owner sets, `book` pulls exactly that much, or reverts without any
-    ///      state change when the buyer cannot pay it.
+    /// @dev For any price the owner sets, once it is in force (the next UTC day) `book` pulls exactly
+    ///      that much, or reverts without any state change when the buyer cannot pay it.
     function testFuzz_book_pullsExactlyThePriceOrNothing(uint256 newPrice) public {
         vm.prank(owner);
         page.setPrice(newPrice);
+        assertEq(page.price(), PRICE, "a price change must not land before midnight");
+        vm.warp(block.timestamp + DAY);
         assertEq(page.price(), newPrice);
 
         uint256 balance = scoop.balanceOf(alice);
@@ -319,18 +322,27 @@ contract ScoopFrontPageFuzzTest is Test {
         }
     }
 
-    /// @dev A refund is always what was paid, never the price at veto time, in both directions.
+    /// @dev A refund is always what was paid, never the price at veto time, in both directions. The
+    ///      price change at booking is made to land (next UTC day) before the booking, and the price
+    ///      change at veto is likewise in force (another day later) when the veto happens.
     function testFuzz_veto_refundsWhatWasPaidNotCurrentPrice(uint256 priceAtBooking, uint256 priceAtVeto) public {
         priceAtBooking = bound(priceAtBooking, 0, 100 * PRICE);
-        uint256 day = _tomorrow();
 
         vm.prank(owner);
         page.setPrice(priceAtBooking);
+        vm.warp(block.timestamp + DAY);
+        assertEq(page.price(), priceAtBooking);
+
+        // Two days ahead so the day has not started once the second price change is in force.
+        uint256 day = _tomorrow() + 1;
         _book(alice, day);
         assertEq(page.slotOf(day).paid, priceAtBooking);
 
         vm.prank(owner);
         page.setPrice(priceAtVeto);
+        vm.warp(block.timestamp + DAY);
+        assertEq(page.price(), priceAtVeto);
+        assertLt(block.timestamp, day * DAY, "harness: the day must not have started yet");
 
         vm.prank(owner);
         page.veto(day);
@@ -341,16 +353,20 @@ contract ScoopFrontPageFuzzTest is Test {
     /// @dev A burn moves what was paid, never the price at burn time.
     function testFuzz_burn_movesWhatWasPaidNotCurrentPrice(uint256 priceAtBooking, uint256 priceAtBurn) public {
         priceAtBooking = bound(priceAtBooking, 0, 100 * PRICE);
-        uint256 day = _tomorrow();
 
         vm.prank(owner);
         page.setPrice(priceAtBooking);
+        vm.warp(block.timestamp + DAY);
+        assertEq(page.price(), priceAtBooking);
+
+        uint256 day = _tomorrow();
         _book(alice, day);
 
         vm.prank(owner);
         page.setPrice(priceAtBurn);
 
         vm.warp((day + 1) * DAY);
+        assertEq(page.price(), priceAtBurn, "the burn-time price is in force by the time the day ended");
         page.burn(day);
         assertEq(scoop.balanceOf(DEAD), priceAtBooking);
         assertEq(scoop.balanceOf(address(page)), 0);
@@ -363,6 +379,165 @@ contract ScoopFrontPageFuzzTest is Test {
         vm.prank(caller);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, caller));
         page.setPrice(newPrice);
+        assertEq(page.price(), PRICE);
+        (uint256 next, uint256 fromDay) = page.nextPrice();
+        assertEq(next, PRICE, "a refused call left a schedule behind");
+        assertEq(fromDay, 0);
+        vm.warp(block.timestamp + DAY);
+        assertEq(page.price(), PRICE, "a refused call changed tomorrow's price");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Price schedule: a change lands at the next midnight UTC, never before, never later
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    /// @dev Set at any second of the day, probed at any later second: the old price holds until the
+    ///      last second of the day and the new one holds from the first second of the next day on.
+    function testFuzz_setPrice_landsExactlyAtMidnight(uint256 newPrice, uint256 secondOfDay, uint256 probe) public {
+        secondOfDay = bound(secondOfDay, 0, DAY - 1);
+        probe = bound(probe, secondOfDay, 40 * DAY);
+        vm.warp(START_DAY * DAY + secondOfDay);
+
+        vm.prank(owner);
+        page.setPrice(newPrice);
+        (uint256 next, uint256 fromDay) = page.nextPrice();
+        assertEq(next, newPrice);
+        assertEq(fromDay, START_DAY + 1);
+
+        vm.warp(START_DAY * DAY + probe);
+        bool landed = probe >= DAY;
+        assertEq(page.price(), landed ? newPrice : PRICE, "price at the probe second");
+        (next, fromDay) = page.nextPrice();
+        assertEq(next, newPrice, "nextPrice keeps reporting the last scheduled value");
+        assertEq(fromDay, START_DAY + 1);
+    }
+
+    /// @dev Any number of changes within one UTC day: none of them moves today's price or what a
+    ///      booking made today pays; only the last one is in force at midnight.
+    function testFuzz_setPrice_repeatedSameDayOnlyLastLands(uint256 seed, uint256 count) public {
+        count = bound(count, 1, 8);
+        uint256 last;
+        uint256 t = START_DAY * DAY;
+        for (uint256 i = 0; i < count; i++) {
+            // Strictly increasing timestamps within the same day.
+            t += 1 + uint256(keccak256(abi.encode(seed, "t", i))) % ((DAY - 1) / 8 - 1);
+            vm.warp(t);
+            last = uint256(keccak256(abi.encode(seed, "p", i))) % (10 * PRICE);
+            vm.prank(owner);
+            page.setPrice(last);
+            assertEq(page.price(), PRICE, "today's price moved");
+            (uint256 next, uint256 fromDay) = page.nextPrice();
+            assertEq(next, last);
+            assertEq(fromDay, START_DAY + 1);
+        }
+        assertEq(page.currentDay(), START_DAY, "harness: stayed within the day");
+
+        // A booking at the very end of the day still pays the price quoted all day.
+        vm.warp((START_DAY + 1) * DAY - 1);
+        uint256 before = scoop.balanceOf(alice);
+        _book(alice, START_DAY + 1);
+        assertEq(before - scoop.balanceOf(alice), PRICE);
+
+        vm.warp((START_DAY + 1) * DAY);
+        assertEq(page.price(), last, "the last scheduled price is the one in force");
+    }
+
+    /// @dev A change scheduled on day d, then another on a later day d+g: the first is in force for
+    ///      the whole of d+1..d+g, the second from d+g+1. A booking on day d+g pays the first.
+    function testFuzz_setPrice_chainAcrossDays(uint256 p1, uint256 p2, uint256 gap, uint256 secondOfDay) public {
+        p1 = bound(p1, 0, 10 * PRICE);
+        gap = bound(gap, 1, 400);
+        secondOfDay = bound(secondOfDay, 0, DAY - 1);
+
+        vm.prank(owner);
+        page.setPrice(p1);
+
+        vm.warp((START_DAY + gap) * DAY + secondOfDay);
+        assertEq(page.price(), p1);
+        vm.prank(owner);
+        page.setPrice(p2);
+        assertEq(page.price(), p1, "the second change landed on the day it was made");
+        (uint256 next, uint256 fromDay) = page.nextPrice();
+        assertEq(next, p2);
+        assertEq(fromDay, START_DAY + gap + 1);
+
+        uint256 before = scoop.balanceOf(alice);
+        _book(alice, START_DAY + gap + 1);
+        assertEq(before - scoop.balanceOf(alice), p1, "a booking on the day of the change pays the old price");
+
+        vm.warp((START_DAY + gap + 1) * DAY - 1);
+        assertEq(page.price(), p1);
+        vm.warp((START_DAY + gap + 1) * DAY);
+        assertEq(page.price(), p2);
+        vm.warp((START_DAY + gap + 1000) * DAY);
+        assertEq(page.price(), p2, "a schedule with no successor stays in force");
+    }
+
+    /// @dev The documented residual race: a sponsor approves exactly the quoted price in the last
+    ///      second of the day and the booking is mined after midnight, when a scheduled change is in
+    ///      force. With an exact allowance a higher price reverts in `transferFrom` and stores nothing;
+    ///      a lower price pulls only the lower amount. The sponsor never pays more than they approved.
+    function testFuzz_crossMidnightRace_exactAllowanceNeverOverpulls(uint256 newPrice) public {
+        newPrice = bound(newPrice, 0, 3 * PRICE);
+        address carol = makeAddr("carol");
+        scoop.transfer(carol, 3 * PRICE);
+
+        vm.prank(owner);
+        page.setPrice(newPrice);
+
+        // 23:59:59: the sponsor reads price() and approves exactly that.
+        vm.warp((START_DAY + 1) * DAY - 1);
+        uint256 quoted = page.price();
+        assertEq(quoted, PRICE);
+        vm.prank(carol);
+        scoop.approve(address(page), quoted);
+        uint256 day = page.currentDay() + 2; // still inside the window after midnight
+
+        // 00:00:00: the booking lands.
+        vm.warp((START_DAY + 1) * DAY);
+        assertEq(page.price(), newPrice);
+        vm.prank(carol);
+        if (newPrice > quoted) {
+            vm.expectRevert(
+                abi.encodeWithSelector(
+                    IERC20Errors.ERC20InsufficientAllowance.selector, address(page), quoted, newPrice
+                )
+            );
+        }
+        page.book(day, promoted, "H", "");
+
+        if (newPrice > quoted) {
+            assertEq(page.slotOf(day).buyer, address(0), "a failed cross-midnight booking was stored");
+            assertEq(scoop.balanceOf(carol), 3 * PRICE);
+            assertEq(scoop.allowance(carol, address(page)), quoted, "allowance consumed without a booking");
+        } else {
+            assertEq(page.slotOf(day).paid, newPrice);
+            assertEq(scoop.balanceOf(carol), 3 * PRICE - newPrice);
+            assertLe(3 * PRICE - scoop.balanceOf(carol), quoted, "sponsor paid more than approved");
+        }
+    }
+
+    /// @dev Pinned: the change scheduled at the last second of the day lands one second later.
+    function test_setPrice_atLastSecondLandsNextSecond() public {
+        vm.warp((START_DAY + 1) * DAY - 1);
+        vm.prank(owner);
+        page.setPrice(7e18);
+        assertEq(page.price(), PRICE);
+        vm.warp(block.timestamp + 1);
+        assertEq(page.price(), 7e18);
+    }
+
+    /// @dev Pinned: scheduling the price the contract already has is a no-op that still emits and
+    ///      still reports the schedule.
+    function test_setPrice_samePriceIsHarmless() public {
+        vm.expectEmit(true, true, true, true);
+        emit ScoopFrontPage.PriceChanged(PRICE, PRICE, START_DAY + 1);
+        vm.prank(owner);
+        page.setPrice(PRICE);
+        (uint256 next, uint256 fromDay) = page.nextPrice();
+        assertEq(next, PRICE);
+        assertEq(fromDay, START_DAY + 1);
+        vm.warp(block.timestamp + DAY);
         assertEq(page.price(), PRICE);
     }
 
@@ -491,26 +666,31 @@ contract ScoopFrontPageFuzzTest is Test {
         page.book(first + 30, promoted, "H", "");
     }
 
-    /// @dev Veto, rebook by someone else, then burn: the refund goes to the first buyer, the burn
-    ///      takes the second buyer's payment, and the archive records the second buyer.
+    /// @dev Veto, rebook by someone else at a different price, then burn: the refund goes to the first
+    ///      buyer at the first price, the burn takes the second buyer's payment at the second price,
+    ///      and the archive records the second buyer.
     function test_vetoRebookBurnSequence() public {
-        uint256 day = _tomorrow();
         vm.prank(owner);
         page.setPrice(3 * PRICE);
+        vm.warp(block.timestamp + DAY); // 3x in force
+        uint256 day = _tomorrow() + 1;
         _book(alice, day);
+        assertEq(page.slotOf(day).paid, 3 * PRICE);
+        assertEq(scoop.balanceOf(alice), 97 * PRICE);
 
         vm.prank(owner);
         page.setPrice(PRICE);
+        vm.warp(block.timestamp + DAY); // 1x in force; `day` is now tomorrow and not yet started
         vm.prank(owner);
         page.veto(day);
-        assertEq(scoop.balanceOf(alice), 100 * PRICE);
+        assertEq(scoop.balanceOf(alice), 100 * PRICE, "refund is the 3x that was paid");
 
         _book(bob, day);
         assertEq(page.slotOf(day).paid, PRICE);
 
         vm.warp((day + 1) * DAY);
         page.burn(day);
-        assertEq(scoop.balanceOf(DEAD), PRICE);
+        assertEq(scoop.balanceOf(DEAD), PRICE, "burn is the 1x bob paid");
         assertEq(scoop.balanceOf(bob), 99 * PRICE);
         assertEq(scoop.balanceOf(address(page)), 0);
         assertEq(page.slotOf(day).buyer, bob);

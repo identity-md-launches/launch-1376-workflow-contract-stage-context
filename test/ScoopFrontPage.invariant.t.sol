@@ -23,7 +23,23 @@ contract FrontPageHandler is Test {
 
     address public ghostOwner;
     address public ghostPendingOwner;
-    uint256 public ghostPrice;
+
+    // ── Price schedule, modelled from the brief rather than from the contract's storage ─────────
+    /// @dev Every accepted `setPrice`, in call order: the UTC day it was made on and the value. The
+    ///      price in force on day T is the value of the last entry made on a day strictly before T,
+    ///      or the opening price when there is none. Days only move forward, so entries are sorted.
+    struct PriceSet {
+        uint256 day;
+        uint256 value;
+    }
+
+    PriceSet[] public priceSets;
+    uint256 public immutable openingPrice;
+
+    /// @dev The price first observed on the current UTC day, and that day. Whatever the owner does
+    ///      later the same day, `price()` must still read this until midnight.
+    uint256 public quotedDay;
+    uint256 public quotedPrice;
 
     address[] public actors;
     uint256 public immutable initialActorBalance;
@@ -65,7 +81,9 @@ contract FrontPageHandler is Test {
         page = page_;
         scoop = scoop_;
         ghostOwner = owner_;
-        ghostPrice = page_.price();
+        openingPrice = page_.INITIAL_PRICE();
+        quotedDay = block.timestamp / DAY;
+        quotedPrice = page_.price();
         actors = actors_;
         initialActorBalance = perActor;
         for (uint256 i = 0; i < actors_.length; i++) {
@@ -80,6 +98,36 @@ contract FrontPageHandler is Test {
 
     function touchedDayCount() external view returns (uint256) {
         return touchedDays.length;
+    }
+
+    function priceSetCount() external view returns (uint256) {
+        return priceSets.length;
+    }
+
+    /// @dev The price the brief says must be in force on UTC day `day`: the last change made on an
+    ///      earlier day, else the opening price.
+    function expectedPriceOn(uint256 day) public view returns (uint256 p) {
+        p = openingPrice;
+        for (uint256 i = 0; i < priceSets.length; i++) {
+            if (priceSets[i].day < day) p = priceSets[i].value;
+        }
+    }
+
+    /// @dev What `nextPrice()` must report: the last change and the day after it was made, or the
+    ///      opening price from day 0 when the owner never changed it.
+    function expectedSchedule() external view returns (uint256 value, uint256 fromDay) {
+        if (priceSets.length == 0) return (openingPrice, 0);
+        PriceSet storage last = priceSets[priceSets.length - 1];
+        return (last.value, last.day + 1);
+    }
+
+    /// @dev Called at the start of every action: on a new UTC day, record the price quoted for it.
+    function _quoteToday() private {
+        uint256 today = block.timestamp / DAY;
+        if (today != quotedDay) {
+            quotedDay = today;
+            quotedPrice = page.price();
+        }
     }
 
     // ── Actions ─────────────────────────────────────────────────────────────────
@@ -106,6 +154,7 @@ contract FrontPageHandler is Test {
     }
 
     function book(uint256 actorSeed, uint256 dayOffset, uint256 kind, uint256 textSeed) external {
+        _quoteToday();
         BookAttempt memory a;
         a.actor = actors[bound(actorSeed, 0, actors.length - 1)];
         a.today = block.timestamp / DAY;
@@ -120,7 +169,9 @@ contract FrontPageHandler is Test {
         a.zeroToken = kind == 11;
         a.token = a.zeroToken ? address(0) : address(uint160(uint256(keccak256(abi.encode("imd coin", a.day)))));
 
-        a.priceNow = page.price();
+        // The amount a booking must pull is the price quoted for today, not whatever the owner may
+        // have scheduled since. `price()` itself is checked against the ghost schedule by invariant.
+        a.priceNow = quotedPrice;
         a.inWindow = a.day >= a.today + 1 && a.day <= a.today + 30;
         a.free = page.slotOf(a.day).buyer == address(0);
         a.funded = scoop.balanceOf(a.actor) >= a.priceNow;
@@ -167,6 +218,7 @@ contract FrontPageHandler is Test {
     }
 
     function veto(uint256 daySeed, uint256 callerSeed) external {
+        _quoteToday();
         uint256 day = _pickDay(daySeed);
         (address caller, bool isOwner) = _pickCaller(callerSeed);
 
@@ -205,6 +257,7 @@ contract FrontPageHandler is Test {
     }
 
     function burn(uint256 daySeed, uint256 callerSeed) external {
+        _quoteToday();
         uint256 day = _pickDay(daySeed);
         (address caller,) = _pickCaller(callerSeed);
 
@@ -240,26 +293,31 @@ contract FrontPageHandler is Test {
     }
 
     function setPrice(uint256 newPrice, uint256 callerSeed) external {
+        _quoteToday();
         // Up to 3x the opening price so actors can run dry (an exercised failure path) but not
         // immediately. The last bucket is the full uint256 range, which no actor can pay.
         newPrice = bound(newPrice, 0, 3 * page.INITIAL_PRICE() + 1);
         if (newPrice == 3 * page.INITIAL_PRICE() + 1) newPrice = type(uint256).max;
         (address caller, bool isOwner) = _pickCaller(callerSeed);
 
+        uint256 priceBefore = page.price();
         vm.prank(caller);
         try page.setPrice(newPrice) {
             assertTrue(isOwner, "a non-owner changed the price");
             setPriceOk++;
-            ghostPrice = newPrice;
+            priceSets.push(PriceSet({day: block.timestamp / DAY, value: newPrice}));
+            assertEq(page.price(), priceBefore, "setPrice moved today's price");
         } catch (bytes memory reason) {
             assertFalse(isOwner, "owner could not set the price");
             setPriceReverted++;
             assertEq(_selector(reason), Ownable.OwnableUnauthorizedAccount.selector, "wrong error: setPrice");
+            assertEq(page.price(), priceBefore, "a refused setPrice moved the price");
         }
     }
 
     /// @dev Two-step handover to an actor. A stranger's accept must fail; the nominee's must succeed.
     function handover(uint256 nomineeSeed, uint256 strangerSeed) external {
+        _quoteToday();
         address nominee = actors[bound(nomineeSeed, 0, actors.length - 1)];
         address stranger = actors[bound(strangerSeed, 0, actors.length - 1)];
 
@@ -285,10 +343,21 @@ contract FrontPageHandler is Test {
     }
 
     /// @dev Advance time by up to three days so bookings cross "started" and "ended" boundaries.
+    ///      One bucket in eight lands exactly on the next midnight, the second at which a scheduled
+    ///      price must have taken effect; another lands one second before it.
     function warp(uint256 secs) external {
-        secs = bound(secs, 0, 3 * DAY);
-        vm.warp(block.timestamp + secs);
+        _quoteToday();
+        uint256 nextMidnight = (block.timestamp / DAY + 1) * DAY;
+        uint256 pick = bound(secs, 0, 7);
+        if (pick == 0) {
+            vm.warp(nextMidnight);
+        } else if (pick == 1) {
+            vm.warp(nextMidnight - 1);
+        } else {
+            vm.warp(block.timestamp + bound(secs >> 8, 0, 3 * DAY));
+        }
         warps++;
+        _quoteToday();
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -514,8 +583,46 @@ contract ScoopFrontPageInvariantTest is Test {
 
     // ── Owner surface ───────────────────────────────────────────────────────────
 
-    function invariant_priceOnlyMovesByOwner() public view {
-        assertEq(page.price(), handler.ghostPrice(), "price differs from what the owner set");
+    /// @dev `price()` is exactly what the brief's schedule says for today: the last change the owner
+    ///      made on an earlier day, else the opening price. Changes made today are not in force yet.
+    function invariant_priceFollowsTheOwnersSchedule() public view {
+        uint256 today = page.currentDay();
+        assertEq(page.price(), handler.expectedPriceOn(today), "price differs from the owner's schedule");
+        // And tomorrow's price is already determined by what the owner has done so far.
+        assertEq(handler.expectedPriceOn(today + 1), _priceTomorrow(), "tomorrow's price disagrees");
+    }
+
+    /// @dev Whatever the owner did since, the price first read today is still the price now.
+    function invariant_priceNeverMovesWithinADay() public view {
+        if (page.currentDay() == handler.quotedDay()) {
+            assertEq(page.price(), handler.quotedPrice(), "price moved within a UTC day");
+        }
+    }
+
+    /// @dev `nextPrice()` reports the last change and the midnight it lands at.
+    function invariant_nextPriceReportsTheLastChange() public view {
+        (uint256 value, uint256 fromDay) = page.nextPrice();
+        (uint256 expValue, uint256 expDay) = handler.expectedSchedule();
+        assertEq(value, expValue, "nextPrice value differs from the last setPrice");
+        assertEq(fromDay, expDay, "nextPrice day differs from the day after the last setPrice");
+        if (fromDay <= page.currentDay()) assertEq(value, page.price(), "a landed schedule differs from price()");
+    }
+
+    /// @dev Every live booking paid the price in force on the day it was made.
+    function invariant_bookingsPaidTheirDaysPrice() public view {
+        uint256 n = handler.touchedDayCount();
+        for (uint256 i = 0; i < n; i++) {
+            uint256 day = handler.touchedDays(i);
+            ScoopFrontPage.Slot memory s = page.slotOf(day);
+            if (s.buyer == address(0)) continue;
+            assertEq(s.paid, handler.expectedPriceOn(handler.ghostBookedOnDay(day)), "booking paid off-schedule");
+        }
+    }
+
+    /// @dev The contract's own answer for tomorrow: `nextPrice()` if it lands by then, else today's.
+    function _priceTomorrow() private view returns (uint256) {
+        (uint256 value, uint256 fromDay) = page.nextPrice();
+        return fromDay <= page.currentDay() + 1 ? value : page.price();
     }
 
     function invariant_ownershipOnlyMovesByTwoSteps() public view {
